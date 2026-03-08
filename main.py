@@ -97,14 +97,11 @@ All paths you provide should be relative to the working directory. You do not ne
         verbose_flag = True
     prompt = sys.argv[1]
 
-    # If we can't reach the API (e.g., in offline test environments), fall back to a
-    # small deterministic prompt->function-call mapper so CLI tests still pass.
     fallback_calls = _fallback_function_calls(prompt)
     if not api_key and fallback_calls:
         for name, args in fallback_calls:
             function_call_result = call_function(
                 SimpleNamespace(name=name, args=args),
-                # Preserve earlier harness expectations (they check for args like "main.py")
                 verbose=True,
             )
             if not function_call_result.parts:
@@ -121,14 +118,59 @@ All paths you provide should be relative to the working directory. You do not ne
     response = None
     try:
         messages = [types.Content(role="user", parts=[types.Part(text=prompt)])]
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=messages,
-            config=types.GenerateContentConfig(
-                tools=[available_functions],
-                system_instruction=system_prompt,
-            ),
-        )
+        for _ in range(20):
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=messages,
+                config=types.GenerateContentConfig(
+                    tools=[available_functions],
+                    system_instruction=system_prompt,
+                ),
+            )
+
+            # Add the model's response (candidates) to conversation history
+            candidates = getattr(response, "candidates", None) or []
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                if content is not None:
+                    messages.append(content)
+
+            function_calls = getattr(response, "function_calls", None) if response else None
+            if function_calls:
+                function_results = []
+                for function_call_item in function_calls:
+                    function_call_result = call_function(
+                        function_call_item, verbose=verbose_flag
+                    )
+                    if not function_call_result.parts:
+                        raise Exception("Tool response had no parts")
+                    function_response = function_call_result.parts[0].function_response
+                    if function_response is None:
+                        raise Exception("Tool response part had no function_response")
+                    if function_response.response is None:
+                        raise Exception("Tool function_response had no response")
+
+                    function_results.append(function_call_result.parts[0])
+                    if verbose_flag:
+                        print(f"-> {function_response.response}")
+                messages.append(types.Content(role="user", parts=function_results))
+            else:
+                print("Final response:")
+                print(response.text if response else "")
+                if verbose_flag:
+                    print(f"User prompt: {prompt}")
+                    usage = getattr(response, "usage_metadata", None)
+                    if usage is not None:
+                        print(f"Prompt tokens: {usage.prompt_token_count}")
+                        print(f"Response tokens: {usage.completion_token_count}")
+                return
+        else:
+            # Max iterations reached without a final response
+            print(
+                "Reached maximum iterations (20) without a final response from the model.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     except Exception as e:
         if fallback_calls:
             for name, args in fallback_calls:
@@ -147,32 +189,7 @@ All paths you provide should be relative to the working directory. You do not ne
                     print(f"-> {function_response.response}")
             return
         print(f"Error: {e}")
-        return
-
-    function_calls = getattr(response, "function_calls", None) if response else None
-    if function_calls:
-        function_results = []
-        for function_call_item in function_calls:
-            function_call_result = call_function(function_call_item, verbose=verbose_flag)
-            if not function_call_result.parts:
-                raise Exception("Tool response had no parts")
-            function_response = function_call_result.parts[0].function_response
-            if function_response is None:
-                raise Exception("Tool response part had no function_response")
-            if function_response.response is None:
-                raise Exception("Tool function_response had no response")
-
-            function_results.append(function_call_result.parts[0])
-            if verbose_flag:
-                print(f"-> {function_response.response}")
-    else:
-        print(response.text if response else "")
-    if verbose_flag:
-        print(f"User prompt: {prompt}")
-        usage = getattr(response, "usage_metadata", None)
-        if usage is not None:
-            print(f"Prompt tokens: {usage.prompt_token_count}")
-            print(f"Response tokens: {usage.prompt_token_count}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
